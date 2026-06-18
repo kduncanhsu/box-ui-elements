@@ -680,6 +680,123 @@ describe('elements/content-uploader/ContentUploader', () => {
         });
     });
 
+    describe('controlled isExpanded / onToggle', () => {
+        test('uses isExpanded prop value when in controlled mode', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true, isExpanded: true, onToggle: jest.fn() });
+            expect(wrapper.find(UploadsManagerBP).prop('isExpanded')).toBe(true);
+
+            wrapper.setProps({ isExpanded: false });
+            expect(wrapper.find(UploadsManagerBP).prop('isExpanded')).toBe(false);
+        });
+
+        test('falls back to internal state when isExpanded prop is not provided', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            expect(wrapper.find(UploadsManagerBP).prop('isExpanded')).toBe(false);
+
+            wrapper.setState({ isUploadsManagerExpanded: true });
+            expect(wrapper.find(UploadsManagerBP).prop('isExpanded')).toBe(true);
+        });
+
+        test('toggleUploadsManager calls onToggle with next value in controlled mode and does not mutate internal state', () => {
+            const onToggle = jest.fn();
+            const wrapper = getWrapper({
+                enableModernizedUploads: true,
+                useUploadsManager: true,
+                isExpanded: false,
+                onToggle,
+            });
+
+            wrapper.instance().toggleUploadsManager();
+
+            expect(onToggle).toHaveBeenCalledTimes(1);
+            expect(onToggle).toHaveBeenCalledWith(true);
+            expect(wrapper.state().isUploadsManagerExpanded).toBe(false);
+        });
+
+        test('toggleUploadsManager flips internal state in uncontrolled mode and fires onToggle', () => {
+            const onToggle = jest.fn();
+            const wrapper = getWrapper({ useUploadsManager: true, onToggle });
+
+            wrapper.instance().toggleUploadsManager();
+
+            expect(wrapper.state().isUploadsManagerExpanded).toBe(true);
+            expect(onToggle).toHaveBeenCalledTimes(1);
+            expect(onToggle).toHaveBeenCalledWith(true);
+        });
+
+        test('toggleUploadsManager does not require onToggle in uncontrolled mode', () => {
+            const wrapper = getWrapper({ useUploadsManager: true });
+
+            expect(() => wrapper.instance().toggleUploadsManager()).not.toThrow();
+            expect(wrapper.state().isUploadsManagerExpanded).toBe(true);
+        });
+
+        test('auto-expand on file-count threshold does not mutate state in controlled mode', () => {
+            const onToggle = jest.fn();
+            const wrapper = getWrapper({
+                useUploadsManager: true,
+                isExpanded: false,
+                onToggle,
+            });
+            const instance = wrapper.instance();
+            const mockAPI = { upload: () => {} };
+            instance.createAPIFactory = jest.fn().mockReturnValue({
+                getPlainUploadAPI: () => mockAPI,
+                getChunkedUploadAPI: () => mockAPI,
+            });
+
+            const files = createMockFiles(EXPAND_UPLOADS_MANAGER_ITEMS_NUM_THRESHOLD + 1);
+            wrapper.setProps({ files });
+
+            expect(wrapper.state().isUploadsManagerExpanded).toBe(false);
+            // Auto-expand must not leak into the persisted preference via onToggle.
+            expect(onToggle).not.toHaveBeenCalled();
+        });
+
+        test('controlled-mode collapse runs minimizeUploadsManager side effects (onMinimize, cleanup timer, isAutoExpanded reset)', () => {
+            jest.useFakeTimers();
+            const onToggle = jest.fn();
+            const onMinimize = jest.fn();
+            const wrapper = getWrapper({
+                enableModernizedUploads: true,
+                useUploadsManager: true,
+                isExpanded: true,
+                onToggle,
+                onMinimize,
+            });
+            const instance = wrapper.instance();
+            instance.isAutoExpanded = true;
+            instance.checkClearUploadItems = jest.fn();
+
+            instance.toggleUploadsManager();
+
+            expect(onToggle).toHaveBeenCalledWith(false);
+            expect(onMinimize).toHaveBeenCalledTimes(1);
+            expect(instance.isAutoExpanded).toBe(false);
+            expect(instance.checkClearUploadItems).toHaveBeenCalledTimes(1);
+            // Internal state still owned by consumer — untouched.
+            expect(wrapper.state().isUploadsManagerExpanded).toBe(false);
+            jest.useRealTimers();
+        });
+
+        test('auto-collapse via resetUploadManagerExpandState is a no-op in controlled mode', () => {
+            const onToggle = jest.fn();
+            const wrapper = getWrapper({
+                useUploadsManager: true,
+                isExpanded: true,
+                onToggle,
+            });
+            const instance = wrapper.instance();
+            instance.isAutoExpanded = true;
+
+            instance.resetUploadManagerExpandState();
+
+            expect(instance.isAutoExpanded).toBe(false);
+            expect(wrapper.state().isUploadsManagerExpanded).toBe(false); // initial default
+            expect(onToggle).not.toHaveBeenCalled();
+        });
+    });
+
     describe('componentDidMount()', () => {
         test('adds files to upload queue if isPrepopulateFilesEnabled is true and files are provided', () => {
             const files = createMockFiles(3);
@@ -1300,6 +1417,284 @@ describe('elements/content-uploader/ContentUploader', () => {
                 expect(resetSpy).not.toHaveBeenCalled();
                 expect(uploadFileSpy).not.toHaveBeenCalled();
             });
+
+            test('should pass onItemShare prop to UploadsManagerBP', () => {
+                const onItemShare = jest.fn();
+                const wrapper = getWrapper({ enableModernizedUploads: true, onItemShare });
+                expect(wrapper.find(UploadsManagerBP).prop('onItemShare')).toBe(onItemShare);
+            });
+
+            test('should pass onItemOpen prop to UploadsManagerBP', () => {
+                const onItemOpen = jest.fn();
+                const wrapper = getWrapper({ enableModernizedUploads: true, onItemOpen });
+                expect(wrapper.find(UploadsManagerBP).prop('onItemOpen')).toBe(onItemOpen);
+            });
+
+            test('should default onItemShare to undefined when not provided', () => {
+                const wrapper = getWrapper({ enableModernizedUploads: true });
+                expect(wrapper.find(UploadsManagerBP).prop('onItemShare')).toBeUndefined();
+            });
+
+            test('should default onItemOpen to undefined when not provided', () => {
+                const wrapper = getWrapper({ enableModernizedUploads: true });
+                expect(wrapper.find(UploadsManagerBP).prop('onItemOpen')).toBeUndefined();
+            });
+        });
+    });
+
+    describe('modernized panel open/close lifecycle', () => {
+        const HIDE_DELAY_MS = 8000;
+
+        const makeItem = (name, status) => {
+            let progress = 0;
+            if (status === STATUS_COMPLETE) {
+                progress = 100;
+            } else if (status === STATUS_IN_PROGRESS) {
+                progress = 50;
+            }
+            return { name, extension: 'pdf', progress, status, file: { name } };
+        };
+
+        const armDismissTimer = wrapper => {
+            const instance = wrapper.instance();
+            wrapper.setState({
+                modernizedPanelState: 'shown',
+                items: [makeItem('a.pdf', STATUS_IN_PROGRESS)],
+            });
+            wrapper.setState({
+                items: [makeItem('a.pdf', STATUS_COMPLETE)],
+            });
+            return instance;
+        };
+
+        beforeEach(() => {
+            jest.useFakeTimers();
+        });
+
+        afterEach(() => {
+            jest.useRealTimers();
+        });
+
+        test('starts dismiss timer when batch transitions to all-complete and panel is shown', () => {
+            const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+
+            expect(instance.modernizedDismissTimer).not.toBeNull();
+            expect(setTimeoutSpy).toHaveBeenCalledWith(expect.any(Function), HIDE_DELAY_MS);
+            setTimeoutSpy.mockRestore();
+        });
+
+        test('transitions to dismissing only after the full delay', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            armDismissTimer(wrapper);
+
+            jest.advanceTimersByTime(HIDE_DELAY_MS - 1);
+            expect(wrapper.state('modernizedPanelState')).toBe('shown');
+
+            jest.advanceTimersByTime(1);
+            expect(wrapper.state('modernizedPanelState')).toBe('dismissing');
+        });
+
+        test('clears timer when a new in-progress item is added mid-wait', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+
+            jest.advanceTimersByTime(4000);
+
+            wrapper.setState({
+                items: [makeItem('a.pdf', STATUS_COMPLETE), makeItem('b.pdf', STATUS_IN_PROGRESS)],
+            });
+
+            expect(instance.modernizedDismissTimer).toBeNull();
+
+            jest.advanceTimersByTime(HIDE_DELAY_MS);
+            expect(wrapper.state('modernizedPanelState')).toBe('shown');
+        });
+
+        test('clears timer when an item flips to STATUS_ERROR mid-wait', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+
+            jest.advanceTimersByTime(4000);
+
+            wrapper.setState({
+                items: [makeItem('a.pdf', STATUS_COMPLETE), makeItem('b.pdf', STATUS_ERROR)],
+            });
+
+            expect(instance.modernizedDismissTimer).toBeNull();
+            expect(wrapper.state('modernizedPanelState')).toBe('shown');
+        });
+
+        test('hover cancels the timer and mouse-leave re-arms it', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+
+            instance.handleModernizedMouseEnter();
+
+            expect(instance.isPanelHovered).toBe(true);
+            expect(instance.modernizedDismissTimer).toBeNull();
+
+            instance.handleModernizedMouseLeave();
+
+            expect(instance.isPanelHovered).toBe(false);
+            expect(instance.modernizedDismissTimer).not.toBeNull();
+
+            jest.advanceTimersByTime(HIDE_DELAY_MS);
+            expect(wrapper.state('modernizedPanelState')).toBe('dismissing');
+        });
+
+        test('keyboard focus cancels the timer and blur re-arms it', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+
+            instance.handleModernizedFocus({
+                target: { matches: () => true },
+            });
+
+            expect(instance.isPanelFocused).toBe(true);
+            expect(instance.modernizedDismissTimer).toBeNull();
+
+            instance.handleModernizedBlur({
+                relatedTarget: null,
+                currentTarget: { contains: () => false },
+            });
+
+            expect(instance.isPanelFocused).toBe(false);
+            expect(instance.modernizedDismissTimer).not.toBeNull();
+
+            jest.advanceTimersByTime(HIDE_DELAY_MS);
+            expect(wrapper.state('modernizedPanelState')).toBe('dismissing');
+        });
+
+        test('mouse-induced focus does not cancel the timer', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+
+            instance.handleModernizedFocus({
+                target: { matches: () => false },
+            });
+
+            expect(instance.isPanelFocused).toBe(false);
+            expect(instance.modernizedDismissTimer).not.toBeNull();
+        });
+
+        test('blur to a child element does not re-arm the timer', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+
+            instance.handleModernizedFocus({
+                target: { matches: () => true },
+            });
+            expect(instance.modernizedDismissTimer).toBeNull();
+
+            const childNode = {};
+            instance.handleModernizedBlur({
+                relatedTarget: childNode,
+                currentTarget: { contains: target => target === childNode },
+            });
+
+            expect(instance.isPanelFocused).toBe(true);
+            expect(instance.modernizedDismissTimer).toBeNull();
+        });
+
+        test('handleModernizedAnimationEnd finalizes dismiss only for the slide-out animation', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = wrapper.instance();
+            const resetSpy = jest
+                .spyOn(instance, 'resetUploadsManagerItemsWhenUploadsComplete')
+                .mockImplementation(() => {});
+
+            wrapper.setState({ modernizedPanelState: 'dismissing' });
+
+            instance.handleModernizedAnimationEnd({ animationName: 'something-else' });
+            expect(wrapper.state('modernizedPanelState')).toBe('dismissing');
+            expect(resetSpy).not.toHaveBeenCalled();
+
+            instance.handleModernizedAnimationEnd({ animationName: 'bcu-modernized-slideOut' });
+            expect(wrapper.state('modernizedPanelState')).toBe('hidden');
+            expect(resetSpy).toHaveBeenCalled();
+        });
+
+        test('dismisses only after the latest batch completes when multiple rapid batches occur', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+
+            jest.advanceTimersByTime(3000);
+
+            wrapper.setState({
+                items: [
+                    makeItem('a.pdf', STATUS_COMPLETE),
+                    makeItem('b.pdf', STATUS_COMPLETE),
+                    makeItem('c.pdf', STATUS_IN_PROGRESS),
+                ],
+            });
+            expect(instance.modernizedDismissTimer).toBeNull();
+
+            wrapper.setState({
+                items: [
+                    makeItem('a.pdf', STATUS_COMPLETE),
+                    makeItem('b.pdf', STATUS_COMPLETE),
+                    makeItem('c.pdf', STATUS_COMPLETE),
+                ],
+            });
+            expect(instance.modernizedDismissTimer).not.toBeNull();
+
+            jest.advanceTimersByTime(3000);
+            expect(wrapper.state('modernizedPanelState')).toBe('shown');
+
+            jest.advanceTimersByTime(5000);
+            expect(wrapper.state('modernizedPanelState')).toBe('dismissing');
+        });
+
+        test('returns panel to shown when a new in-progress item arrives while dismissing', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            wrapper.setState({
+                modernizedPanelState: 'dismissing',
+                items: [makeItem('a.pdf', STATUS_COMPLETE)],
+            });
+
+            wrapper.setState({
+                items: [makeItem('a.pdf', STATUS_COMPLETE), makeItem('b.pdf', STATUS_IN_PROGRESS)],
+            });
+
+            expect(wrapper.state('modernizedPanelState')).toBe('shown');
+        });
+
+        test('componentWillUnmount clears the dismiss timer', () => {
+            const clearTimeoutSpy = jest.spyOn(global, 'clearTimeout');
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+            const instance = armDismissTimer(wrapper);
+            const timerId = instance.modernizedDismissTimer;
+
+            wrapper.unmount();
+
+            expect(clearTimeoutSpy).toHaveBeenCalledWith(timerId);
+            clearTimeoutSpy.mockRestore();
+        });
+
+        test('shows panel when items appear from hidden state', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: true });
+
+            expect(wrapper.state('modernizedPanelState')).toBe('hidden');
+
+            wrapper.setState({
+                items: [makeItem('a.pdf', STATUS_IN_PROGRESS)],
+            });
+
+            expect(wrapper.state('modernizedPanelState')).toBe('shown');
+        });
+
+        test('does not change modernized panel state when enableModernizedUploads is false', () => {
+            const wrapper = getWrapper({ enableModernizedUploads: false });
+            const instance = wrapper.instance();
+
+            wrapper.setState({
+                items: [makeItem('a.pdf', STATUS_COMPLETE)],
+            });
+
+            expect(wrapper.state('modernizedPanelState')).toBe('hidden');
+            expect(instance.modernizedDismissTimer).toBeNull();
         });
     });
 });
